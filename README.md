@@ -30,7 +30,7 @@ function id is `user_memory`.
 ## 📁 Project Structure
 
 ```
-openwebui-langgraph-memory-filter/      # folder name predates the LangGraph removal
+openwebui-user-memory-filter/           # renamed from openwebui-langgraph-memory-filter on 2026-10-27
 ├── README.md                    # This file
 ├── filter/
 │   └── user_memory_filter.py    # The filter (installed copy = DB function user_memory)
