@@ -9,7 +9,8 @@ A persistent per-user memory for [Open WebUI](https://github.com/open-webui/open
 extracted by a small local model after each reply, stored in one PostgreSQL table with a pgvector embedding per
 fact, and the nearest ones are injected into the next request by vector search (reranked when Open WebUI has a
 reranker configured). Embeddings come from Open WebUI's own configured embedding model. LangGraph was removed on
-2026-10-18, the relevance model on 2026-10-24 (v7.0); the installed function id is `user_memory`.
+2026-10-18, the relevance model on 2026-10-24 (v7.0); memories carry dates since 2026-10-27 (v7.2); the installed
+function id is `user_memory`.
 
 ## Author
 
@@ -160,8 +161,11 @@ Reply length of the helper model is set on its workspace preset (`max_tokens`), 
 
 **Outlet** (after the reply is streamed): schedule a background task, return immediately. The task embeds the
 (scrubbed) latest user message and sends `memory-manager` today's date, the `always_inject_types` facts plus the
-`max_memories` nearest existing facts, the previous 3 user messages as context and the latest user message, and asks
-only for what changes: new facts, updated facts (same type+subject), and `"remove": true` entries. Nothing changes
+`max_memories` nearest existing facts (each with its `last_updated` date), the previous 3 user messages as context and
+the latest user message, and asks only for what changes: new facts, updated facts (same type+subject), and
+`"remove": true` entries. The prompt tells the model not to store passing states (sleep, mood, energy, "today" /
+"last night") and to return a stored passing-state `status` fact older than 14 days as a removal when the new message
+does not reaffirm it; long-running situations are never expired. Nothing changes
 on most turns and the reply is `{"facts": []}`. Each change is embedded (`subject: value`) and applied to its own row:
 removal is a `DELETE`; a new `(type, subject)` whose embedding is ≥ `dedupe_threshold` similar to an existing fact of
 the same type is applied to that row instead (logged as *merged*); otherwise `INSERT ... ON CONFLICT` writes value,
@@ -180,7 +184,9 @@ all (one embedding call, one SQL query, an optional reranker call).
 ## 📍 Where the memories are injected (2026-10-16)
 
 The inlet adds the recalled memories to the outgoing request only; the stored chat never contains them. They are
-appended to the latest user message under a `[Relevant memories about the user]` header. The persona system prompt,
+appended to the latest user message under a `[Relevant memories about the user]` header. Since v7.2 the block header
+carries today's date and every fact ends with `(as of YYYY-MM-DD)`, its `last_updated` in the server's local zone, so
+the chat model can tell last night's remark from a year-old fact. The persona system prompt,
 tool specs and chat history therefore stay byte-identical from turn to turn, so the server reuses its prompt cache
 (llama.cpp reuses the longest identical token prefix); only the block and the new message are prefilled. This works
 with every chat template and survives Open WebUI's tool-call continuation requests, which are not filtered again.

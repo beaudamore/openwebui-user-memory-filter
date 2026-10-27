@@ -1,10 +1,10 @@
 """
 title: User Memory
 author: beaudamore
-date: 2026-10-24
-version: 7.1
+date: 2026-10-27
+version: 7.2
 license: MIT
-description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
+description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts, each dated, into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
 required_open_webui_version: >= 0.11.0
 requirements: psycopg[binary], aiohttp
 """
@@ -1217,6 +1217,9 @@ class Filter:
                 out = {"type": f.get("type"), "subject": f.get("subject"), "value": f.get("value")}
                 if f.get("sentiment"):
                     out["sentiment"] = f["sentiment"]
+                stated = self._local_date(f.get("last_updated"))
+                if stated:
+                    out["last_updated"] = stated
                 return out
 
             # Local date of the server (honours the container's TZ), so "this year"
@@ -1308,8 +1311,18 @@ NEW MESSAGE:
         window = [m for m in messages if m.get("role") in ("user", "assistant")][-n:]
         return "\n".join(t for t in (content_to_text(m.get("content")) for m in window) if t)
 
+    @staticmethod
+    def _local_date(iso: Any) -> str:
+        """YYYY-MM-DD of an ISO timestamp in the server's local zone; '' when unparseable."""
+        try:
+            return datetime.fromisoformat(str(iso)).astimezone().strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            return ""
+
     def _format_memory_context(self, facts: List[Dict[str, Any]]) -> str:
-        """Render the selected facts grouped by type. Every type is rendered; no caps."""
+        """Render the selected facts grouped by type, each with the date it was last
+        stated, under a header carrying today's date, so the chat model can tell a
+        fact from last night apart from one from last year. Every type is rendered; no caps."""
         if not facts:
             return ""
         by_type: Dict[str, List[Dict[str, Any]]] = {}
@@ -1326,7 +1339,8 @@ NEW MESSAGE:
             "event": "Events/Dates",
         }
         order = list(headers) + sorted(t for t in by_type if t not in headers)
-        parts = ["=== USER MEMORY PROFILE ==="]
+        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        parts = [f"=== USER MEMORY PROFILE (today is {today}; each fact shows the date it was last stated) ==="]
         for t in order:
             if t not in by_type:
                 continue
@@ -1335,12 +1349,14 @@ NEW MESSAGE:
             for f in by_type[t]:
                 subject = str(f.get("subject", "")).replace("_", " ").title()
                 value = f.get("value", "")
+                stated = self._local_date(f.get("last_updated"))
+                suffix = f" (as of {stated})" if stated else ""
                 if t == "preference" and f.get("sentiment") == "positive":
-                    parts.append(f"  - Likes: {value}")
+                    parts.append(f"  - Likes: {value}{suffix}")
                 elif t == "preference" and f.get("sentiment") == "negative":
-                    parts.append(f"  - Dislikes: {value}")
+                    parts.append(f"  - Dislikes: {value}{suffix}")
                 else:
-                    parts.append(f"  - {subject}: {value}")
+                    parts.append(f"  - {subject}: {value}{suffix}")
         parts.append("")
         parts.append("=== END MEMORY PROFILE ===")
         return "\n".join(parts)
