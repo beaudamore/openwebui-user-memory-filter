@@ -48,7 +48,8 @@ CRITICAL RULES:
    - RIGHT: subject "pet_pepper" and subject "pet_bunny_boy"; subject "vehicle_tesla" and "vehicle_corvette"
 5. Reuse the EXACT type and subject of an existing fact when you update or remove it
 6. Resolve relative dates with TODAY: "this year" is TODAY's year, "last month" is the month before TODAY, "yesterday" is the day before TODAY. Write dates as YYYY-MM-DD when the day is known; never store a bare "yesterday", "last night" or "this week" in a value
-7. EXPIRE STALE STATES: an existing status fact that describes a passing state (sleep, mood, energy, tiredness, a cold, "this week") whose last_updated is more than 14 days before TODAY, and which the NEW MESSAGE does not reaffirm, is returned with "remove": true. Long-running situations (weight, a diagnosis, employment, housing) are never expired this way
+7. REMOVE PASSING STATES ON SIGHT: an existing status fact that describes a passing state (how the user slept or felt on a given day, mood, energy, tiredness, a cold, anything worded "this morning", "last night", "yesterday", "this week") is returned with "remove": true whenever you see it, unless the NEW MESSAGE restates it as ongoing. Its last_updated does not matter. Long-running situations (weight, a diagnosis, employment, housing, a pattern described over weeks or months) are never removed this way
+8. A PASSING STATE NEVER OVERWRITES AN ONGOING STATUS: if the NEW MESSAGE reports a one-day state (slept well, feels better today) and an existing status fact with a related subject describes an ongoing situation, return nothing for that subject. Do not replace the ongoing description with the one-day report
 
 MERGE RULES:
 - "I sold my X" / "I no longer have X" -> return that fact with "remove": true

@@ -1,8 +1,8 @@
 """
 title: User Memory
 author: beaudamore
-date: 2026-10-27
-version: 7.2
+date: 2026-10-28
+version: 7.3
 license: MIT
 description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts, each dated, into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
 required_open_webui_version: >= 0.11.0
@@ -1340,7 +1340,10 @@ NEW MESSAGE:
         }
         order = list(headers) + sorted(t for t in by_type if t not in headers)
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
-        parts = [f"=== USER MEMORY PROFILE (today is {today}; each fact shows the date it was last stated) ==="]
+        parts = [
+            f"=== USER MEMORY PROFILE (today is {today}; each fact shows the date it was last stated; "
+            "words like 'this morning' or 'yesterday' inside a fact refer to that date, not to today) ==="
+        ]
         for t in order:
             if t not in by_type:
                 continue
