@@ -119,7 +119,7 @@ docker-compose -f docker-compose.langgraph.yml up -d
 
 ## ⚙️ Configuration
 
-The filter has these valves (2026-10-18). Everything else was removed as dead or harmful configuration;
+The filter has these valves (table current as of v7.4, 2026-11-04). Everything else was removed as dead or harmful configuration;
 see "How it works" below for what is fixed behaviour.
 
 | Valve | Default | Description |
@@ -148,7 +148,7 @@ Per-user valves: `enabled`, `show_status`.
 
 Reply length of the helper model is set on its workspace preset (`max_tokens`), not by the filter.
 
-## ⚙️ How it works (2026-10-24, v7.0)
+## ⚙️ How it works (v7.0 design of 2026-10-24, current as of v7.4)
 
 **Inlet** (before the chat model sees the request; no model call):
 1. First use only: open the store, create the extension/tables, and check the stored embedding model and
@@ -182,7 +182,7 @@ Measured before 2026-10-18 (43 turns): the inlet blocked each reply for a median
 relevance 10 s). Since 2026-10-18 extraction is off the reply path; since 2026-10-24 the inlet makes no model call at
 all (one embedding call, one SQL query, an optional reranker call).
 
-## 📍 Where the memories are injected (2026-10-16)
+## 📍 Where the memories are injected (decided 2026-10-16, re-measured 2026-11-04)
 
 The inlet adds the recalled memories to the outgoing request only; the stored chat never contains them. They are
 appended to the latest user message under a `[Relevant memories about the user]` header. Since v7.2 the block header
@@ -190,16 +190,81 @@ carries today's date and every fact ends with `(as of YYYY-MM-DD)`, its `last_up
 the chat model can tell last night's remark from a year-old fact; since v7.3 the header also says that relative words
 inside a fact refer to that date, not to today. The persona system prompt,
 tool specs and chat history therefore stay byte-identical from turn to turn, so the server reuses its prompt cache
-(llama.cpp reuses the longest identical token prefix); only the block and the new message are prefilled. This works
+(llama.cpp reuses the longest identical token prefix). On the next turn the previous block is gone from history, so the server re-prefills from the previous user message onward (its reply and the new message); everything before it stays cached. This works
 with every chat template and survives Open WebUI's tool-call continuation requests, which are not filtered again.
 
 There is no placement valve (removed 2026-10-18). The alternatives were measured and rejected: a separate system
 message after the user turn is merged by Open WebUI into the first system message before sending, and prepending to
 the system prompt re-prefills the whole conversation whenever the recalled set changes (65 s at 12.5k tokens).
 
-Server side, `--checkpoint-min-step 2048` on the llama.cpp chat server bounds the redo when the prompt changes mid-way
+Server side, `--checkpoint-min-step 512` (2048 until 2026-11-02) on the llama.cpp chat server bounds the redo when the prompt changes mid-way
 (details in `~/Source/local-llm-config/README.md`, "Prompt cache, checkpoints and the memory filter").
 The installed copy is the DB function `user_memory` and equals `filter/user_memory_filter.py`.
+
+## 📜 History, measurements and why (updated 2026-11-04)
+
+The filter went through four shapes. Each step was driven by a measurement on Beau's M1 Ultra (Qwen3.8-27B on llama.cpp
+behind the SSD prompt-cache shim, bge-m3 and bge-reranker-v2-m3 on llama.cpp, Postgres + pgvector):
+
+| Date / version | Shape | Why it changed | Measured |
+|---|---|---|---|
+| to 2026-10-18 (LangGraph, v4) | one JSON blob of facts per user in LangGraph checkpoints; extraction and a relevance LLM ran **inside the inlet** | the reply waited for two model calls every turn; one bad fact copied into every later checkpoint | inlet blocked each reply by a median **36.5 s** (extraction 27 s + relevance 10 s, 43 turns) |
+| 2026-10-18/19 (v6.0) | LangGraph removed; `user_facts` table, **one row per fact** (PK user + type + subject); extraction moved to a background task after the reply | removal and updates per row instead of rewriting a blob; the inlet no longer calls the extraction model | inlet = relevance model only |
+| 2026-10-24 (v7.0/7.1) | relevance LLM replaced by **pgvector cosine search + Open WebUI's reranker**; embeddings from Open WebUI's own embedding function with auto re-embed on model change | the relevance model was the last model call on the reply path and separated weakly | inlet = 1 embedding call + 1 SQL query + 1 rerank call; cosine alone: unrelated facts 0.40-0.50, on-topic 0.50-0.65 with bge-m3 |
+| 2026-10-27/28 (v7.2/7.3) | dates on every fact and in the injected block (v7.2); passing states removed instead of expired after 14 days (v7.3) | the chat model confused last night's remark with a year-old fact | — |
+| 2026-11-04 morning | reranker server moved from half to full GPU offload (`-ngl 12` -> `-ngl 99`), embedder too | retrieval took 11-43 s per turn: the reranker scored 17-23 candidates against the whole 6-message window (~3.5k tokens each, ~60-80k tokens per turn) on a half-CPU model | retrieval **42.9 s -> 10.8 s** with the reranker on the GPU (rerank 40.0 s -> 8.0 s, embed 2.9 s -> 2.7 s, SQL ~0.1 s); the embedder followed to the GPU the same day, after which an embed call is ~1 s |
+| 2026-11-04 (v7.4) | `extraction_task_name` valve: the extraction call carries `metadata.task` | Open WebUI merges the chat's metadata into server-side calls, so the extraction request reached the SSD shim under the **chat's own id**, ran in the chat's slot and threw the chat's cached prompt away **every turn** | next-turn prefill **25,027 tokens / 135 s** and 29,338 / 162 s before; **683 tokens / 4.2 s** and 1,232 / 7.6 s after (cache restored from SSD in 0.3-0.8 s) |
+| 2026-11-04 evening | extraction model (`memory-manager`) back on Gemma 4 12B, now on llama.cpp (port 8186), away from the chat server | task calls on the 27B borrowed a chat slot (save + restore each turn) and ran 2x slower | extraction: 4,079-token prompt in 12.5 s at 326 tok/s, 175 tokens out; a "no changes" turn: 2,705 tokens in 8.5 s, 6 tokens out; chat slot untouched |
+
+Why the pieces are where they are:
+
+- **Retrieval has no model call** because the only thing that must be fast is the wait before the first token. Embedding + SQL + rerank is a few seconds, dominated by the rerank (~0.5 s per candidate pair of ~3.5k tokens on the GPU); a relevance LLM was 10 s and separated no better than cosine + reranker.
+- **Memories are appended to the latest user message, after the history**, so the persona prompt, tool specs and history are byte-identical across turns and llama.cpp reuses the cached prefix. The price is that the previous turn's injected block disappears from history on the next turn, so the server re-prefills from that point (previous user message + previous reply + new message). That is inherent to per-turn injection and is why long replies cost prefill on the following turn. Measured alternatives: a separate system message is merged by Open WebUI into the first one (cache miss from the top); prepending to the system prompt re-prefilled the whole chat whenever the set changed (65 s at 12.5k tokens).
+- **Extraction is a task, not the chat.** Any server-side call made with the chat's `request` inherits the chat's metadata (`chat_id`, user, session). A prompt-cache proxy keyed on the chat id (the SSD shim via `X-OpenWebUI-Chat-Id: {{CHAT_ID}}`) therefore mistakes the extraction prompt for a turn of the chat. `metadata.task` survives the merge because the chat's metadata has no `task` key; the connection header `X-OpenWebUI-Task: {{TASK}}` renders it, and the shim gives the call a task slot. The same mechanism Open WebUI uses for title/tags/queries and for its own Context Compaction (`task: context_compaction`).
+- **The extraction model is small and separate** (Gemma 4 12B on its own port) because the call happens after every reply and must never compete with the chat server for a slot. Its own 2 slots absorb the post-reply burst (title, tags, follow-ups, extraction) that arrives at once.
+- **One row per fact** because updates and removals then touch one row, dedup can be done by embedding similarity (`dedupe_threshold`, "job" vs "occupation" measured 0.951), and a wrong fact cannot be copied forward.
+
+One chat turn, as it runs today:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User (Open WebUI)
+    participant F as user_memory filter
+    participant E as bge-m3 (8181)
+    participant P as Postgres + pgvector
+    participant R as bge-reranker (8182)
+    participant S as SSD cache shim (8180)
+    participant C as Qwen3.8-27B chat (8190)
+    participant G as Gemma 4 12B tasks (8186)
+
+    U->>F: inlet(body)
+    F->>F: wait for the previous turn's extraction (per-user lock)
+    F->>P: always-inject facts
+    F->>E: embed last 6 messages (~3.5k tokens, ~1 s on the GPU)
+    F->>P: nearest 3 x max_memories facts by cosine
+    F->>F: keep those >= relevance_threshold (17-23 in practice)
+    F->>R: rerank them against the window (~1 s on the GPU)
+    F->>U: latest user message + "[Relevant memories about the user]" block appended
+    U->>S: chat request, header X-OpenWebUI-Chat-Id, empty X-OpenWebUI-Task
+    S->>C: pinned slot for this chat (restore from SSD if evicted, ~0.3-1 s)
+    C-->>S: reply stream
+    S-->>U: reply (prefill only the changed tail; 14-17 tok/s decode at 25k ctx)
+    U->>F: outlet(body) returns at once, schedules extraction
+    F->>F: take the per-user lock (the next inlet waits on it)
+    F->>E: embed the new user message
+    F->>P: nearest existing facts (threshold 0)
+    F->>R: rerank candidates
+    F->>G: memory-manager prompt, metadata.task = memory_extraction (~4k tokens, ~12 s)
+    note over G: header X-OpenWebUI-Task renders the task,<br/>so a shim in front keys it as a task, never as the chat
+    G-->>F: {"facts": [changes]} (often empty)
+    F->>E: embed each changed fact (subject: value)
+    F->>P: dedupe SELECT, then INSERT ... ON CONFLICT / UPDATE / DELETE per fact
+```
+
+Numbers worth keeping in mind when tuning: the rerank cost is `candidates x window tokens` (up to 3 x `max_memories` candidates after `relevance_threshold`, 17-23 in
+practice; 6 messages of window by default); the extraction prompt is ~4k tokens regardless of chat length; the next turn's prefill is the
+previous turn's tail, so long replies, tool results and search results are what cost time, not the memories.
 
 ## 🧪 Testing
 
