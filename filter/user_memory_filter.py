@@ -2,7 +2,7 @@
 title: User Memory
 author: beaudamore
 date: 2026-10-28
-version: 7.3
+version: 7.4
 license: MIT
 description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts, each dated, into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
 required_open_webui_version: >= 0.11.0
@@ -423,6 +423,10 @@ class Filter:
         extraction_model_id: str = Field(
             default="memory-manager",
             description="Open WebUI model id for fact extraction. Create a workspace model with prompt/MERGE_PROMPT_memory-manager.md as its system prompt.",
+        )
+        extraction_task_name: str = Field(
+            default="memory_extraction",
+            description="Sent as metadata.task on the extraction call, so a connection header such as X-OpenWebUI-Task: {{TASK}} marks it as a side task like Open WebUI's own title/tags calls. Without it the call inherits the chat's id and a prompt-cache shim (e.g. llama.cpp-ssd-cache-shim) runs it in the chat's slot and discards the chat's cached prompt, forcing a full re-prefill on the next turn (measured 2026-11-04: 25k tokens, 135 s). Empty = send no task marker.",
         )
 
         # UI Configuration
@@ -1008,6 +1012,12 @@ class Filter:
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
             }
+            # Open WebUI merges the chat's request.state.metadata over this dict
+            # (utils/chat.py), so chat_id still arrives; the chat metadata has no
+            # "task" key, so ours survives and the connection's {{TASK}} header renders it.
+            task_name = self.valves.extraction_task_name.strip()
+            if task_name:
+                payload["metadata"] = {"task": task_name}
 
             self._log(
                 f"Extraction payload: model={payload['model']}, prompt_len={len(prompt)}",

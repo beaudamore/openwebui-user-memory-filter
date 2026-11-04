@@ -155,7 +155,11 @@ Remember: Return ONLY the JSON object. No markdown, no explanations.
    ```yaml
    extraction_model_id: "memory-manager"
    extraction_model_temperature: 0.1  # Low for consistent JSON
+   extraction_task_name: "memory_extraction"  # v7.4: sent as metadata.task; see README "Configuration"
    ```
+3. If the model's connection sits behind a prompt-cache shim (llama.cpp-ssd-cache-shim), add the
+   connection header `X-OpenWebUI-Task: {{TASK}}` next to `X-OpenWebUI-Chat-Id: {{CHAT_ID}}`, so the
+   extraction call is keyed as a side task and does not evict the chat's cached prompt (2026-11-04).
 
 ---
 

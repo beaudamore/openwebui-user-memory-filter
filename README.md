@@ -9,7 +9,7 @@ A persistent per-user memory for [Open WebUI](https://github.com/open-webui/open
 extracted by a small local model after each reply, stored in one PostgreSQL table with a pgvector embedding per
 fact, and the nearest ones are injected into the next request by vector search (reranked when Open WebUI has a
 reranker configured). Embeddings come from Open WebUI's own configured embedding model. LangGraph was removed on
-2026-10-18, the relevance model on 2026-10-24 (v7.0); memories carry dates since 2026-10-27 (v7.2, v7.3 on 2026-10-28); the installed
+2026-10-18, the relevance model on 2026-10-24 (v7.0); memories carry dates since 2026-10-27 (v7.2, v7.3 on 2026-10-28; v7.4 on 2026-11-04 adds `extraction_task_name` so the extraction call no longer evicts the chat from the prompt cache); the installed
 function id is `user_memory`.
 
 ## Author
@@ -127,6 +127,7 @@ see "How it works" below for what is fixed behaviour.
 | `priority` | `10` | Filter order in Open WebUI (lower runs first) |
 | `postgres_url` / `postgres_database` / `postgres_user` / `postgres_password` | (required) / `langgraph_memory` / `langgraph` / ... | Where the fact store lives. `postgres_url` is `scheme://host` or `scheme://host:port` (default port 5432), e.g. `http://langgraph-pgvector` or `http://10.5.10.100:5432`. The filter does not care how the database is deployed. |
 | `extraction_model_id` | `memory-manager` | Workspace model that returns fact changes (prompt: `prompt/MERGE_PROMPT_memory-manager.md`) |
+| `extraction_task_name` | `memory_extraction` | Sent as `metadata.task` on the extraction call (v7.4). With a connection header `X-OpenWebUI-Task: {{TASK}}`, a prompt-cache shim such as llama.cpp-ssd-cache-shim treats the call as a side task instead of the chat itself. Without it the call inherits the chat's id, runs in the chat's slot and throws away the chat's cached prompt, so every next turn re-prefills the whole conversation (measured 2026-11-04: 25k tokens, 135 s before the first token). Empty = no marker |
 | `query_window_messages` | `6` | How many of the most recent user/assistant messages are embedded as the search text. `1` = the latest user message only |
 | `relevance_threshold` | `0.45` | Minimum cosine similarity for a fact to be a candidate; `0` = no cutoff. Scale depends on the embedding model: with bge-m3 on short facts, unrelated facts measure 0.40-0.50 and on-topic ones 0.50-0.65 (2026-10-24), so cosine alone separates weakly and the reranker does the real ordering |
 | `max_memories` | `20` | Top N candidates injected (after reranking when Open WebUI has a reranker, by similarity otherwise), not counting `always_inject_types`; also how many nearest facts the extraction model sees. `0` = no cap |
