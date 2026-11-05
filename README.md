@@ -9,7 +9,7 @@ A persistent per-user memory for [Open WebUI](https://github.com/open-webui/open
 extracted by a small local model after each reply, stored in one PostgreSQL table with a pgvector embedding per
 fact, and the nearest ones are injected into the next request by vector search (reranked when Open WebUI has a
 reranker configured). Embeddings come from Open WebUI's own configured embedding model. LangGraph was removed on
-2026-10-18, the relevance model on 2026-10-24 (v7.0); memories carry dates since 2026-10-27 (v7.2, v7.3 on 2026-10-28; v7.4 on 2026-11-04 adds `extraction_task_name` so the extraction call no longer evicts the chat from the prompt cache); the installed
+2026-10-18, the relevance model on 2026-10-24 (v7.0); memories carry dates since 2026-10-27 (v7.2, v7.3 on 2026-10-28; v7.4 on 2026-11-04 adds `extraction_task_name` so the extraction call no longer evicts the chat from the prompt cache; v7.5 on 2026-11-05 shows every stored value of a fact in the injected block); the installed
 function id is `user_memory`.
 
 ## Author
@@ -119,7 +119,7 @@ docker-compose -f docker-compose.langgraph.yml up -d
 
 ## ⚙️ Configuration
 
-The filter has these valves (table current as of v7.4, 2026-11-04). Everything else was removed as dead or harmful configuration;
+The filter has these valves (table current as of v7.5, 2026-11-05). Everything else was removed as dead or harmful configuration;
 see "How it works" below for what is fixed behaviour.
 
 | Valve | Default | Description |
@@ -148,7 +148,7 @@ Per-user valves: `enabled`, `show_status`.
 
 Reply length of the helper model is set on its workspace preset (`max_tokens`), not by the filter.
 
-## ⚙️ How it works (v7.0 design of 2026-10-24, current as of v7.4)
+## ⚙️ How it works (v7.0 design of 2026-10-24, current as of v7.5)
 
 **Inlet** (before the chat model sees the request; no model call):
 1. First use only: open the store, create the extension/tables, and check the stored embedding model and
@@ -186,9 +186,12 @@ all (one embedding call, one SQL query, an optional reranker call).
 
 The inlet adds the recalled memories to the outgoing request only; the stored chat never contains them. They are
 appended to the latest user message under a `[Relevant memories about the user]` header. Since v7.2 the block header
-carries today's date and every fact ends with `(as of YYYY-MM-DD)`, its `last_updated` in the server's local zone, so
+carries today's date and every fact carries its `last_updated` date in the server's local zone, so
 the chat model can tell last night's remark from a year-old fact; since v7.3 the header also says that relative words
-inside a fact refer to that date, not to today. The persona system prompt,
+inside a fact refer to that date, not to today. Since v7.5 every fact line shows all of its stored values:
+`- Subject: value (sentiment negative, confidence 0.8, first stated YYYY-MM-DD, last stated YYYY-MM-DD)`, and the
+header explains them. Preferences are rendered the same way as every other type (no `Likes:` / `Dislikes:` lines).
+Confidence is displayed only; it does not affect which facts are selected. The persona system prompt,
 tool specs and chat history therefore stay byte-identical from turn to turn, so the server reuses its prompt cache
 (llama.cpp reuses the longest identical token prefix). On the next turn the previous block is gone from history, so the server re-prefills from the previous user message onward (its reply and the new message); everything before it stays cached. This works
 with every chat template and survives Open WebUI's tool-call continuation requests, which are not filtered again.
@@ -201,7 +204,7 @@ Server side, `--checkpoint-min-step 512` (2048 until 2026-11-02) on the llama.cp
 (details in `~/Source/local-llm-config/README.md`, "Prompt cache, checkpoints and the memory filter").
 The installed copy is the DB function `user_memory` and equals `filter/user_memory_filter.py`.
 
-## 📜 History, measurements and why (updated 2026-11-04)
+## 📜 History, measurements and why (updated 2026-11-05)
 
 The filter went through four shapes. Each step was driven by a measurement on Beau's M1 Ultra (Qwen3.8-27B on llama.cpp
 behind the SSD prompt-cache shim, bge-m3 and bge-reranker-v2-m3 on llama.cpp, Postgres + pgvector):
@@ -215,6 +218,7 @@ behind the SSD prompt-cache shim, bge-m3 and bge-reranker-v2-m3 on llama.cpp, Po
 | 2026-11-04 morning | reranker server moved from half to full GPU offload (`-ngl 12` -> `-ngl 99`), embedder too | retrieval took 11-43 s per turn: the reranker scored 17-23 candidates against the whole 6-message window (~3.5k tokens each, ~60-80k tokens per turn) on a half-CPU model | retrieval **42.9 s -> 10.8 s** with the reranker on the GPU (rerank 40.0 s -> 8.0 s, embed 2.9 s -> 2.7 s, SQL ~0.1 s); the embedder followed to the GPU the same day, after which an embed call is ~1 s |
 | 2026-11-04 (v7.4) | `extraction_task_name` valve: the extraction call carries `metadata.task` | Open WebUI merges the chat's metadata into server-side calls, so the extraction request reached the SSD shim under the **chat's own id**, ran in the chat's slot and threw the chat's cached prompt away **every turn** | next-turn prefill **25,027 tokens / 135 s** and 29,338 / 162 s before; **683 tokens / 4.2 s** and 1,232 / 7.6 s after (cache restored from SSD in 0.3-0.8 s) |
 | 2026-11-04 evening | extraction model (`memory-manager`) back on Gemma 4 12B, now on llama.cpp (port 8186), away from the chat server | task calls on the 27B borrowed a chat slot (save + restore each turn) and ran 2x slower | extraction: 4,079-token prompt in 12.5 s at 326 tok/s, 175 tokens out; a "no changes" turn: 2,705 tokens in 8.5 s, 6 tokens out; chat slot untouched |
+| 2026-11-05 (v7.5) | every stored value of a fact is shown in the injected block: subject, value, sentiment, confidence, first and last stated dates; the `Likes:` / `Dislikes:` lines are gone | sentiment reached the chat model only on positive/negative preferences (8 of 65 facts), confidence and `first_mentioned` never | not measured (each fact line is longer) |
 
 Why the pieces are where they are:
 

@@ -1,10 +1,10 @@
 """
 title: User Memory
 author: beaudamore
-date: 2026-10-28
-version: 7.4
+date: 2026-11-05
+version: 7.5
 license: MIT
-description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts, each dated, into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
+description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts, each with its sentiment, confidence and first/last stated dates, into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
 required_open_webui_version: >= 0.11.0
 requirements: psycopg[binary], aiohttp
 """
@@ -1330,9 +1330,11 @@ NEW MESSAGE:
             return ""
 
     def _format_memory_context(self, facts: List[Dict[str, Any]]) -> str:
-        """Render the selected facts grouped by type, each with the date it was last
-        stated, under a header carrying today's date, so the chat model can tell a
-        fact from last night apart from one from last year. Every type is rendered; no caps."""
+        """Render the selected facts grouped by type under a header carrying today's
+        date. Every stored value of a fact is shown: subject, value, sentiment,
+        confidence, and the dates it was first and last stated, so the chat model can
+        tell a fact from last night apart from one from last year and a firm fact from
+        a tentative one. Every type is rendered; no caps."""
         if not facts:
             return ""
         by_type: Dict[str, List[Dict[str, Any]]] = {}
@@ -1351,8 +1353,9 @@ NEW MESSAGE:
         order = list(headers) + sorted(t for t in by_type if t not in headers)
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         parts = [
-            f"=== USER MEMORY PROFILE (today is {today}; each fact shows the date it was last stated; "
-            "words like 'this morning' or 'yesterday' inside a fact refer to that date, not to today) ==="
+            f"=== USER MEMORY PROFILE (today is {today}; each fact shows its sentiment, the confidence it "
+            "was recorded with (0 to 1), and the dates it was first and last stated; words like "
+            "'this morning' or 'yesterday' inside a fact refer to its last stated date, not to today) ==="
         ]
         for t in order:
             if t not in by_type:
@@ -1362,14 +1365,19 @@ NEW MESSAGE:
             for f in by_type[t]:
                 subject = str(f.get("subject", "")).replace("_", " ").title()
                 value = f.get("value", "")
-                stated = self._local_date(f.get("last_updated"))
-                suffix = f" (as of {stated})" if stated else ""
-                if t == "preference" and f.get("sentiment") == "positive":
-                    parts.append(f"  - Likes: {value}{suffix}")
-                elif t == "preference" and f.get("sentiment") == "negative":
-                    parts.append(f"  - Dislikes: {value}{suffix}")
-                else:
-                    parts.append(f"  - {subject}: {value}{suffix}")
+                details = []
+                if f.get("sentiment"):
+                    details.append(f"sentiment {f['sentiment']}")
+                if f.get("confidence") is not None:
+                    details.append(f"confidence {f['confidence']:g}")
+                first = self._local_date(f.get("first_mentioned"))
+                if first:
+                    details.append(f"first stated {first}")
+                last = self._local_date(f.get("last_updated"))
+                if last:
+                    details.append(f"last stated {last}")
+                suffix = f" ({', '.join(details)})" if details else ""
+                parts.append(f"  - {subject}: {value}{suffix}")
         parts.append("")
         parts.append("=== END MEMORY PROFILE ===")
         return "\n".join(parts)
