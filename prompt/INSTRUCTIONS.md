@@ -9,7 +9,8 @@ Open WebUI's reranker when one is configured. There is no relevance model.
 
 Embeddings are not configured in the filter. It uses the embedding model Open WebUI has under
 **Admin Panel > Settings > Documents** (and the reranking model there, if any). Change them whenever you like: the
-filter notices on its next start and re-embeds every stored fact.
+filter checks the model once per Open WebUI start and then re-embeds every stored fact, so restart Open WebUI after
+changing the embedding model (reindex on change).
 
 ## Setup
 
@@ -40,7 +41,9 @@ cosine similarity, which matters because short facts cluster closely in embeddin
 
 1. Go to **Admin Panel** → **Functions** → **User Memory**
 2. Set valves:
-   - `postgres_url`: `scheme://host` or `scheme://host:port`, e.g. `http://langgraph-pgvector` or `http://10.5.10.100:5432`
+   - `postgres_url`: `scheme://host` or `scheme://host:port`; with `docker/user-memory-pgvector.yml` it is `http://user-memory-pgvector`
+   - `postgres_database`: `user_memory`
+   - `postgres_user`: `user_memory`
    - `postgres_password`: your password
    - `extraction_model_id`: `memory-manager` (default)
    - `always_inject_types`: `["identity"]` (fact types injected on every turn)
@@ -67,7 +70,8 @@ The Tesla should replace the Corvette, not add alongside it.
 2. **Embed** the last `query_window_messages` user/assistant messages as one search text
 3. **Retrieve**: `always_inject_types` facts, plus the nearest other facts with similarity ≥ `relevance_threshold`,
    reranked when Open WebUI has a reranker, top `max_memories` kept
-4. **Inject** the facts, grouped by type, appended to the latest user message
+4. **Inject** the facts not already recalled earlier in this chat, grouped by type, as a hidden tool result right
+   after the latest user message; the outlet saves it with the reply
 5. **Reply streams** to the user
 6. **Outlet schedules a background task**: the extraction model gets the always-inject facts + the `max_memories`
    nearest existing facts + 3 earlier user messages + the latest user message and returns only changes
@@ -102,23 +106,23 @@ candidate's similarity and rerank score), or lower `max_memories`. Configure a r
 ### PostgreSQL connection errors
 ```bash
 # Check if postgres is running
-docker ps | grep langgraph-pgvector
+docker ps | grep user-memory-pgvector
 
 # Test connection
-docker exec -it langgraph-pgvector psql -U langgraph -d langgraph_memory -c "SELECT 1"
+docker exec -it user-memory-pgvector psql -U user_memory -d user_memory -c "SELECT 1"
 ```
 
 ### View stored facts
 
 ```bash
-docker exec -it langgraph-pgvector psql -U langgraph -d langgraph_memory -c \
+docker exec -it user-memory-pgvector psql -U user_memory -d user_memory -c \
   "SELECT user_id, type, subject, value, last_updated FROM user_facts ORDER BY user_id, first_mentioned;"
 ```
 
 ### Clear all memories (reset)
 
 ```bash
-docker exec -it langgraph-pgvector psql -U langgraph -d langgraph_memory -c "TRUNCATE user_facts;"
+docker exec -it user-memory-pgvector psql -U user_memory -d user_memory -c "TRUNCATE user_facts;"
 ```
 
 ## Architecture
@@ -134,7 +138,7 @@ pgvector search in user_facts: always-inject types + nearest facts ≥ threshold
      ↓
 Rerank (Open WebUI's reranker, if configured) → top max_memories
      ↓
-Append Selected Facts to the latest user message
+Add the facts not yet recalled in this chat as a hidden tool result after the latest user message
      ↓
 Main Model (with focused memory context)
      ↓

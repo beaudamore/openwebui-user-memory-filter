@@ -1,0 +1,88 @@
+# User Memory filter database: PostgreSQL 16 with the pgvector extension.
+# One stack: user-memory-pgvector. The stack, the database service and its
+# container all carry that name.
+#
+# The filter runs inside the open-webui container and reaches this database
+# over the shared webui-network by container name: user-memory-pgvector, port
+# 5432. Filter valves that must match this file:
+#   postgres_url       http://user-memory-pgvector
+#   postgres_database  user_memory
+#   postgres_user      user_memory
+#   postgres_password  the POSTGRES_PASSWORD value below
+# Publish a host port only when the database runs on a different machine
+# from Open WebUI (see the commented ports: block).
+#
+# Data lives on a bind mount, one root per stack:
+# ~/docker-data/user-memory-pgvector/postgres. Write the host paths below as
+# absolute paths for your machine. POSTGRES_DB, POSTGRES_USER and
+# POSTGRES_PASSWORD are only read on the first start, when that folder is
+# empty; changing them here later does not change an existing database.
+#
+# OPTIONAL: pgAdmin (user-memory-pgadmin) is a web UI for this database, at
+# http://localhost:5050. Log in with PGADMIN_DEFAULT_EMAIL and
+# PGADMIN_DEFAULT_PASSWORD below (also only read on its first start), then
+# Servers > Register > Server:
+#   Host name/address     user-memory-pgvector
+#   Port                  5432
+#   Maintenance database  user_memory
+#   Username              user_memory
+#   Password              the POSTGRES_PASSWORD value below
+# Its settings live in ~/docker-data/user-memory-pgvector/pgadmin. The filter
+# does not need pgAdmin; remove the service if you do not want it.
+
+services:
+  user-memory-pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: user-memory-pgvector
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: user_memory
+      POSTGRES_USER: user_memory
+      POSTGRES_PASSWORD: change_me # set your own before the first start
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - /Users/beaudamore/docker-data/user-memory-pgvector/postgres:/var/lib/postgresql/data
+
+    # Only when Open WebUI runs on another machine. Not needed on webui-network.
+    # ports:
+    #   - "5435:5432"
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user_memory -d user_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - webui-network
+
+  # OPTIONAL: pgAdmin, a web UI for looking at the database. The filter never
+  # uses it. Delete this whole service block to run the database alone.
+  user-memory-pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: user-memory-pgadmin
+    restart: unless-stopped
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com # set your own before the first start
+      PGADMIN_DEFAULT_PASSWORD: change_me # set your own before the first start
+
+    volumes:
+      # pgAdmin's own settings and saved connections; container runs as uid 5050
+      - /Users/beaudamore/docker-data/user-memory-pgvector/pgadmin:/var/lib/pgadmin
+
+    ports:
+      - "5050:80"
+
+    depends_on:
+      user-memory-pgvector:
+        condition: service_healthy
+
+    networks:
+      - webui-network
+
+networks:
+  webui-network:
+    external: true

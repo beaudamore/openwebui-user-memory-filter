@@ -32,11 +32,9 @@ async def main():
     assert out == "my card is [REDACTED] and I'm Beau", out            # default labels keep the name
     assert (await f._validate_fact({"type": "identity", "subject": "name", "value": "Beau"}))["clean"]
     r = await f._validate_fact({"type": "status", "subject": "password", "value": "hunter2"})
-    assert not r["clean"] and r["blocked_reasons"] == ["secret detected in value"] and r["scrubbed_fact"]["value"] == "[REDACTED]", r
+    assert not r["clean"] and r["blocked_reasons"] == ["secret detected in value"], r
     facts = [{"type": "preference", "subject": "coffee", "value": "likes espresso"}, {"type": "status", "subject": "password", "value": "hunter2"}]
     assert [x["subject"] for x in await f._filter_facts_pii(facts)] == ["coffee"]
-    f.valves.pii_filter_mode = "redact"
-    assert [x["value"] for x in await f._filter_facts_pii(facts)] == ["likes espresso", "[REDACTED]"]
     f.valves.pii_tracer_labels = list(mod.PII_TRACER_LABELS)                      # names included -> name redacted
     assert await f._pii_scrub("Beau") == "[REDACTED]"
     # fallback

@@ -1,11 +1,11 @@
 """
 title: User Memory
 author: beaudamore
-date: 2026-11-05
-version: 7.5
+date: 2026-11-23
+version: 8.4
 license: MIT
-description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts, each with its sentiment, confidence and first/last stated dates, into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
-required_open_webui_version: >= 0.11.0
+description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and gives the model the nearest facts, each with its sentiment, confidence and first/last stated dates, as a hidden tool result right after the latest user message (no relevance model); outlet saves that hidden tool result with the reply, so every later turn replays it unchanged and nothing shows in the chat bubble; a fact already recalled earlier in the chat is not sent again until it changes; then extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model. ADMIN: after changing the embedding model, restart Open WebUI; the filter checks the model once per start and then re-embeds every fact (reindex on change). PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
+required_open_webui_version: >= 0.13.3
 requirements: psycopg[binary], aiohttp
 """
 
@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import asyncio
 import re
+import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 from urllib.parse import quote_plus, urlparse
@@ -26,21 +29,32 @@ import aiohttp
 import psycopg
 
 # Open WebUI imports
+from open_webui.models.config import Config
 from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.misc import convert_output_to_messages
 
-try:  # the prefixes Open WebUI itself sends to the embedding model (None unless set by env)
-    from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX, RAG_EMBEDDING_CONTENT_PREFIX
-except Exception:  # pragma: no cover
-    RAG_EMBEDDING_QUERY_PREFIX = RAG_EMBEDDING_CONTENT_PREFIX = None
 
 logger = logging.getLogger("openwebui.filters.user_memory")
 logger.setLevel(logging.INFO)
 
+# The recalled facts reach the model as the result of a tool call with this name. It is not a tool the
+# model can call; Open WebUI shows the same kind of entry for its own list_available_skills.
+RECALL_TOOL_NAME = "recall_user_memories"
+# Recalled facts waiting for their reply to finish (inlet -> outlet). Replies that never reach the
+# outlet (errors, cancelled requests) leave an entry behind; the oldest are dropped past this count.
+PENDING_RECALL_MAX = 256
+# The extraction model call is given this long; after it the turn's memory update is skipped and
+# the per-user lock is released.
+EXTRACTION_TIMEOUT_SECONDS = 300
+# The inlet waits this long for the previous turn's extraction to finish, then recalls without
+# that turn's new facts instead of holding the user's message back.
+INLET_WAIT_FOR_EXTRACTION_SECONDS = 30
+
 # A fact is a dict: {type, subject, value, sentiment, confidence, first_mentioned, last_updated},
-# one row per fact in table user_facts, plus an `embedding` vector of "subject: value". Types the extraction prompt uses: identity, status,
-# preference, ownership, relationship, goal, skill, event. Any type string is accepted and
-# rendered. Facts are unique per user on lower-cased (type, subject), which is how they are
+# one row per fact in table user_facts, plus an `embedding` vector of "subject: value". The types that may be
+# stored, their headings and their order are the fact_types valve, which is also sent to the
+# extraction model with every call. Facts are unique per user on lower-cased (type, subject), which is how they are
 # stored; see _fact_key.
 
 
@@ -146,21 +160,6 @@ PII_PATTERNS: List[Dict[str, Any]] = [
     },
 ]
 
-# Fact-type allowlist: these types are safe to store (no PII scrub needed at type level)
-# The PII scrub happens on the *values*, not types — this is just for docs/reference
-SAFE_FACT_TYPES = {
-    "preference",
-    "ownership",
-    "relationship",
-    "goal",
-    "skill",
-    "event",
-    "personality",
-    "interest",
-    "hobby",
-    "trait",
-    "opinion",
-}
 
 # Fact subjects that should ALWAYS be blocked even if the regex doesn't fire
 PII_SUBJECT_BLOCKLIST = {
@@ -193,9 +192,13 @@ PII_TRACER_LABELS = [
     "secret",
     "other_pii",
 ]
-# Default labels for the memory path: names and dates are left out so identity facts
-# ("name = Beau", a birthday) stay storable, as with the regex engine, which never matched names.
-PII_TRACER_MEMORY_LABELS = [l for l in PII_TRACER_LABELS if l not in ("private_person", "private_date")]
+# Default labels for the memory path. Left out: names and dates, so identity facts ("name = Beau",
+# a birthday) stay storable, as with the regex engine, which never matched names; and other_pii, the
+# model's catch-all, which flags ordinary personal facts (it marked "I am actually 187 lbs", and the
+# whole message was redacted before extraction).
+PII_TRACER_MEMORY_LABELS = [
+    l for l in PII_TRACER_LABELS if l not in ("private_person", "private_date", "other_pii")
+]
 
 
 
@@ -239,6 +242,20 @@ def _fact_key(fact: Dict[str, Any]) -> tuple:
     )
 
 
+def _type_title(fact_type: str) -> str:
+    """The heading for a fact type that has none of its own: "work_rule" -> "Work Rule"."""
+    return fact_type.replace("_", " ").title()
+
+
+def _fact_confidence(fact: Dict[str, Any]) -> float:
+    """The confidence the extraction model gave a fact; 0.8 when missing or not a finite number."""
+    try:
+        confidence = float(fact.get("confidence", 0.8))
+    except (TypeError, ValueError):
+        return 0.8
+    return confidence if math.isfinite(confidence) else 0.8
+
+
 def _fact_marked_removed(fact: Dict[str, Any]) -> bool:
     """True when the extraction model explicitly asks to drop this fact."""
     if fact.get("remove") is True or fact.get("removed") is True:
@@ -263,7 +280,7 @@ def detect_pii(text: str, patterns: Optional[List[str]] = None) -> List[Dict[str
 
     findings = []
     for pii in PII_PATTERNS:
-        if patterns and pii["name"] not in patterns:
+        if patterns is not None and pii["name"] not in patterns:
             continue
         for match in pii["pattern"].finditer(text):
             # Run optional validator (e.g., SSN can't start with 000)
@@ -298,7 +315,7 @@ def scrub_pii(
         return text
 
     for pii in PII_PATTERNS:
-        if patterns and pii["name"] not in patterns:
+        if patterns is not None and pii["name"] not in patterns:
             continue
 
         def _replace(match):
@@ -310,87 +327,6 @@ def scrub_pii(
         text = pii["pattern"].sub(_replace, text)
 
     return text
-
-
-def validate_fact_no_pii(fact: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validate a single extracted fact for PII. Returns a dict with:
-      - "clean": bool — True if the fact is safe to store
-      - "blocked_reasons": list of reasons if not clean
-      - "scrubbed_fact": the fact with PII redacted (if partially salvageable)
-    """
-    reasons = []
-
-    # Check subject against blocklist
-    subject_lower = fact.get("subject", "").lower().strip()
-    if subject_lower in PII_SUBJECT_BLOCKLIST:
-        reasons.append(f"Blocked subject: '{fact.get('subject')}'")
-
-    # Check value for PII patterns
-    value = fact.get("value", "")
-    pii_found = detect_pii(value)
-    if pii_found:
-        for p in pii_found:
-            reasons.append(f"{p['label']} detected in value: '{p['match']}'")
-
-    # Check subject field for PII patterns too
-    subject = fact.get("subject", "")
-    subject_pii = detect_pii(subject)
-    if subject_pii:
-        for p in subject_pii:
-            reasons.append(f"{p['label']} detected in subject: '{p['match']}'")
-
-    if reasons:
-        return {
-            "clean": False,
-            "blocked_reasons": reasons,
-            "scrubbed_fact": {
-                **fact,
-                "value": scrub_pii(value),
-                "subject": scrub_pii(subject),
-            },
-        }
-
-    return {"clean": True, "blocked_reasons": [], "scrubbed_fact": fact}
-
-
-def filter_facts_pii(
-    facts: List[Dict[str, Any]],
-    mode: str = "remove",
-    logger_fn: Optional[Callable] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Filter a list of extracted facts, removing or scrubbing PII.
-
-    Args:
-        facts: List of fact dicts from extraction
-        mode: "remove" = drop facts with PII entirely
-              "redact" = keep fact but replace PII with [REDACTED]
-        logger_fn: Optional logging function
-
-    Returns:
-        Cleaned list of facts
-    """
-    cleaned = []
-    for fact in facts:
-        result = validate_fact_no_pii(fact)
-        if result["clean"]:
-            cleaned.append(fact)
-        else:
-            if logger_fn:
-                logger_fn(
-                    f"PII blocked in fact ({fact.get('type')}/{fact.get('subject')}): "
-                    f"{', '.join(result['blocked_reasons'])}"
-                )
-            if mode == "redact":
-                cleaned.append(result["scrubbed_fact"])
-            # else "remove" → skip entirely
-    return cleaned
-
-
-# ============================================================================
-# Filter Implementation
-# ============================================================================
 
 
 class Filter:
@@ -439,10 +375,6 @@ class Filter:
             default="regex",
             description="What finds PII before a fact is stored. 'none': nothing is checked or scrubbed, facts are stored exactly as extracted. 'regex': the built-in patterns (pii_patterns_enabled). 'pii_tracer': Perplexity's PII-Tracer model on a local server (pii_tracer_url, pii_tracer_labels); it reads context, so it also catches values the patterns cannot describe.",
         )
-        pii_filter_mode: Literal["remove", "redact"] = Field(
-            default="remove",
-            description="How to handle facts containing PII. 'remove' = drop the entire fact, 'redact' = store the fact with PII replaced by [REDACTED]",
-        )
         pii_scrub_input: bool = Field(
             default=True,
             description="Scrub PII from messages BEFORE sending to extraction model. Prevents PII from even reaching the LLM. Ignored when pii_engine is 'none'.",
@@ -471,7 +403,7 @@ class Filter:
         )
         pii_tracer_labels: List[str] = Field(
             default=list(PII_TRACER_MEMORY_LABELS),
-            description="PII-Tracer labels treated as PII on the memory path. Default leaves out private_person and private_date so names and birthdays can still be stored as identity facts. Options: " + ", ".join(PII_TRACER_LABELS),
+            description="PII-Tracer labels treated as PII on the memory path. Default leaves out private_person and private_date, so names and birthdays can still be stored as identity facts, and other_pii, the model's catch-all, which redacts ordinary personal facts such as a body weight. Options: " + ", ".join(PII_TRACER_LABELS),
         )
         pii_tracer_fallback: Literal["regex", "allow"] = Field(
             default="regex",
@@ -494,6 +426,25 @@ class Filter:
         always_inject_types: List[str] = Field(
             default=["identity"],
             description="Fact types that are ALWAYS injected regardless of similarity. Identity facts (name, job, location) are usually always useful.",
+        )
+        confidence_floor: float = Field(
+            default=0.0,
+            ge=0.0,
+            le=1.0,
+            description="A fact the extraction model rates below this confidence is not stored. The reference prompt uses 1.0 for an explicit statement, 0.8 for a clear implication and 0.6 for an inference, so 0.7 drops inferences. 0 = store everything. Facts already stored are not affected.",
+        )
+        fact_types: List[str] = Field(
+            default=[
+                "identity: About You",
+                "status: Current Status",
+                "ownership: You Own",
+                "relationship: Relationships",
+                "preference: Preferences",
+                "skill: Skills/Interests",
+                "goal: Goals",
+                "event: Events/Dates",
+            ],
+            description="The fact types, one entry each, written `type` or `type: Heading`. This is the only list of types in the filter. A fact of any other type is not stored (checked in code). Recalled facts are grouped under the heading, in this order; without a heading the type's own name is used. A heading cannot contain a comma (the valve form splits entries on commas). Empty list = any type is stored. The extraction model is sent these names with every call (ALLOWED TYPES). Requests to forget a fact are never blocked by this list.",
         )
         dedupe_threshold: float = Field(
             default=0.9,
@@ -526,6 +477,9 @@ class Filter:
         # Keep references to background extraction tasks so they are not
         # garbage-collected before they finish.
         self._bg_tasks: set = set()
+        # (chat id, assistant message id) -> the hidden tool result the inlet sent for that reply;
+        # the outlet saves it with the reply and removes it here.
+        self._pending_recall: "OrderedDict[tuple, List[Dict[str, Any]]]" = OrderedDict()
         # Set at the start of each memory update; the PII-Tracer failure is logged once per update.
         self._pii_down_logged = False
 
@@ -536,6 +490,11 @@ class Filter:
         # Print to stdout for Docker logs visibility
         print(f"[User Memory] [{level.upper()}] {message}", flush=True)
         getattr(logger, level, logger.info)(f"[User Memory] {message}")
+
+    def _user_valves(self, __user__: Dict[str, Any]) -> "Filter.UserValves":
+        """The calling user's own valves; Open WebUI puts them in __user__["valves"]."""
+        valves = __user__.get("valves")
+        return valves if isinstance(valves, self.UserValves) else self.UserValves()
 
     async def _resolve_user(self, __user__: Optional[Dict[str, Any]]):
         """
@@ -586,7 +545,6 @@ class Filter:
         rag.embedding_model); older versions on request.app.state.config."""
         engine = model = None
         try:
-            from open_webui.models.config import Config  # 0.12+
             cfg = await Config.get_many("rag.embedding_engine", "rag.embedding_model")
             engine, model = cfg.get("rag.embedding_engine"), cfg.get("rag.embedding_model")
         except Exception as e:
@@ -598,14 +556,18 @@ class Filter:
         return f"{engine or 'local'}/{model or 'unknown'}"
 
     async def _embed(
-        self, texts: List[str], request: Any, user: Any, prefix: Optional[str]
+        self, texts: List[str], request: Any, user: Any, kind: Literal["query", "content"]
     ) -> List[List[float]]:
-        """Embed texts with request.app.state.EMBEDDING_FUNCTION (list in, list of vectors out)."""
+        """Embed texts with request.app.state.EMBEDDING_FUNCTION (list in, list of vectors out).
+        `kind` picks the prefix Open WebUI has saved for searches ("query") or for stored text
+        ("content"): the same setting its own document search and memories read, so there is
+        one place to set it (Admin Panel > Settings > Documents)."""
         fn = getattr(getattr(getattr(request, "app", None), "state", None), "EMBEDDING_FUNCTION", None)
         if fn is None:
             raise RuntimeError(
                 "Open WebUI has no embedding function configured (Admin Panel > Settings > Documents > Embedding)."
             )
+        prefix = await Config.get(f"rag.embedding_{kind}_prefix")
         result = fn(texts, prefix=prefix, user=user)
         if asyncio.iscoroutine(result):
             result = await result
@@ -622,7 +584,8 @@ class Filter:
         self, query_text: str, facts: List[Dict[str, Any]], request: Any, user: Any
     ) -> Optional[List[float]]:
         """Scores from request.app.state.RERANKING_FUNCTION (Open WebUI's configured
-        reranker), one per fact, or None when no reranker is configured."""
+        reranker), one per fact. None when no reranker is configured or when it fails or
+        returns no usable scores; the caller then keeps the vector order."""
         fn = getattr(getattr(getattr(request, "app", None), "state", None), "RERANKING_FUNCTION", None)
         if fn is None or len(facts) < 2:
             return None
@@ -634,12 +597,20 @@ class Filter:
                 self.page_content = text
 
         docs = [_Doc(self._fact_text(f)) for f in facts]
-        result = await asyncio.to_thread(fn, query_text, docs, user=user)
-        if asyncio.iscoroutine(result):
-            result = await result
-        if not isinstance(result, list) or len(result) != len(facts):
-            raise RuntimeError(f"Reranker returned {type(result).__name__} for {len(facts)} facts")
-        return [float(x) for x in result]
+        try:
+            result = await asyncio.to_thread(fn, query_text, docs, user=user)
+            if asyncio.iscoroutine(result):
+                result = await result
+            # Open WebUI's local rerankers return a numpy array; its external one returns a
+            # list, or None on any HTTP error.
+            if hasattr(result, "tolist"):
+                result = result.tolist()
+            if not isinstance(result, (list, tuple)) or len(result) != len(facts):
+                raise ValueError(f"got {type(result).__name__} for {len(facts)} facts")
+            return [float(x) for x in result]
+        except Exception as e:
+            self._log(f"Reranker failed ({type(e).__name__}: {e}); using vector order", "warning")
+            return None
 
     # ------------------------------------------------------------------
     # Storage: one row per fact in table user_facts (+ embedding), meta in user_facts_meta
@@ -717,7 +688,7 @@ class Filter:
         """Rebuild the embedding column and every row's vector when Open WebUI's
         embedding model or its dimension differs from what the table was built with."""
         model = await self._embedding_model_name(request)
-        dim = len((await self._embed(["dimension probe"], request, user, RAG_EMBEDDING_CONTENT_PREFIX))[0])
+        dim = len((await self._embed(["dimension probe"], request, user, "content"))[0])
 
         cur = await conn.execute("SELECT embedding_model, embedding_dim FROM user_facts_meta WHERE id = 1")
         meta = await cur.fetchone()
@@ -746,7 +717,7 @@ class Filter:
                 chunk = rows[i : i + batch]
                 vectors = await self._embed(
                     [self._fact_text({"subject": r[2], "value": r[3]}) for r in chunk],
-                    request, user, RAG_EMBEDDING_CONTENT_PREFIX,
+                    request, user, "content",
                 )
                 for r, v in zip(chunk, vectors):
                     await conn.execute(
@@ -796,6 +767,37 @@ class Filter:
             rows = await cur.fetchall()
         return [self._row_to_fact(r) for r in rows]
 
+    # Called by the User Memory Management action (action/user_memory_management.py),
+    # which has no store code of its own.
+    async def list_facts(self, __user__: Dict[str, Any], request: Any) -> List[Dict[str, Any]]:
+        """Every stored fact of this user, oldest first."""
+        # No per-user lock: a read does not have to wait for a running extraction.
+        await self._init_store(request, await self._resolve_user(__user__))
+        return await self._get_all_facts(__user__["id"])
+
+    async def remove_facts(self, __user__: Dict[str, Any], facts: List[Dict[str, Any]], request: Any) -> int:
+        """Delete these facts of this user, matched on type + subject exactly as stored;
+        returns how many rows went."""
+        user = await self._resolve_user(__user__)
+        keys = [(str(f.get("type")), str(f.get("subject"))) for f in facts]
+        async with self._user_lock(__user__["id"]):
+            await self._init_store(request, user)
+            async with await self._connect() as conn:
+                async with conn.transaction():
+                    return await self._delete_facts(conn, __user__["id"], keys)
+
+    @staticmethod
+    async def _delete_facts(conn: psycopg.AsyncConnection, user_id: str, keys: List[tuple]) -> int:
+        """DELETE one row per (type, subject); returns how many rows went."""
+        removed = 0
+        for type_, subject in keys:
+            cur = await conn.execute(
+                "DELETE FROM user_facts WHERE user_id = %s AND type = %s AND subject = %s",
+                (user_id, type_, subject),
+            )
+            removed += cur.rowcount
+        return removed
+
     async def _search_facts(
         self,
         user_id: str,
@@ -821,7 +823,7 @@ class Filter:
             always_facts = [self._row_to_fact(r) for r in await cur.fetchall()]
             if not query_text.strip():
                 return always_facts
-            qvec = self._vec((await self._embed([query_text], request, user, RAG_EMBEDDING_QUERY_PREFIX))[0])
+            qvec = self._vec((await self._embed([query_text], request, user, "query"))[0])
             sql = (
                 f"SELECT {self._FACT_COLS}, 1 - (embedding <=> %s::vector) AS similarity "
                 "FROM user_facts WHERE user_id = %s AND NOT (type = ANY(%s)) AND embedding IS NOT NULL "
@@ -864,48 +866,34 @@ class Filter:
         - INSERT, or UPDATE value/sentiment/confidence/embedding when any differs.
           An unchanged fact is not touched, so last_updated only moves when the fact did.
         - Facts the model did not mention are left alone.
-        Returns counts: updated, added, removed, merged, skipped.
+        Returns counts: updated, added, removed, merged.
         """
-        counts = {"updated": 0, "added": 0, "removed": 0, "merged": 0, "skipped": 0}
+        counts = {"updated": 0, "added": 0, "removed": 0, "merged": 0}
         upserts: List[tuple] = []
         removals: List[tuple] = []
+        # Every item was checked by _usable_changes: text type and subject, and a text value
+        # unless it is a removal.
         for fact in changes:
             type_, subject = _fact_key(fact)
-            if not type_ or not subject:
-                self._log(f"Skipping fact without type/subject: {fact}", "warning")
-                counts["skipped"] += 1
-                continue
             if _fact_marked_removed(fact):
                 removals.append((type_, subject))
                 continue
             value = str(fact.get("value") or "").strip()
-            if not value:
-                self._log(f"Skipping fact without value: {fact}", "warning")
-                counts["skipped"] += 1
-                continue
             sentiment = str(fact.get("sentiment") or "").strip().lower() or None
-            try:
-                confidence = float(fact.get("confidence", 0.8))
-            except (TypeError, ValueError):
-                confidence = 0.8
+            confidence = _fact_confidence(fact)
             upserts.append((type_, subject, value, sentiment, confidence))
 
         vectors = (
             await self._embed(
                 [self._fact_text({"subject": u[1], "value": u[2]}) for u in upserts],
-                request, user, RAG_EMBEDDING_CONTENT_PREFIX,
+                request, user, "content",
             )
             if upserts else []
         )
 
         async with await self._connect() as conn:
             async with conn.transaction():
-                for type_, subject in removals:
-                    cur = await conn.execute(
-                        "DELETE FROM user_facts WHERE user_id = %s AND type = %s AND subject = %s",
-                        (user_id, type_, subject),
-                    )
-                    counts["removed"] += cur.rowcount
+                counts["removed"] = await self._delete_facts(conn, user_id, removals)
                 for (type_, subject, value, sentiment, confidence), vec in zip(upserts, vectors):
                     vlit = self._vec(vec)
                     if self.valves.dedupe_threshold < 1:
@@ -947,8 +935,7 @@ class Filter:
                     counts["added" if row[0] else "updated"] += 1
         self._log(
             f"Applied changes for user {user_id[:8]}...: {counts['updated']} updated, "
-            f"{counts['added']} added, {counts['removed']} removed, {counts['merged']} merged, "
-            f"{counts['skipped']} skipped",
+            f"{counts['added']} added, {counts['removed']} removed, {counts['merged']} merged",
             "info",
         )
         return counts
@@ -1042,7 +1029,7 @@ class Filter:
                 choices = response.get("choices", [])
                 if not choices:
                     self._log(
-                        f"No choices in extraction model response. Full response: {response}",
+                        f"No choices in extraction model response (keys: {list(response.keys())})",
                         "error",
                     )
                     return None
@@ -1060,10 +1047,7 @@ class Filter:
                 )
                 return self._clean_model_response(response_text)
             else:
-                self._log(
-                    f"Unexpected response type from extraction model: {type(response)}. Response: {response}",
-                    "error",
-                )
+                self._log(f"Unexpected response type from extraction model: {type(response)}", "error")
                 return None
 
         except Exception as e:
@@ -1111,15 +1095,15 @@ class Filter:
         return [s for s in data.get("spans", []) if s.get("label") in wanted]
 
     async def _pii_detect(self, text: str) -> List[Dict[str, str]]:
-        """Findings [{label, match}] in text with the configured engine. For the model engine `match` is kept
-        out of log lines by the callers; the regex engine's callers log it as before."""
+        """Findings [{label, match}] in text with the configured engine. `match` is the PII itself and
+        never goes in a log line; callers report the label only."""
         if not self._pii_use_model():
-            return [{"label": p["label"], "match": p["match"]} for p in detect_pii(text)]
+            return [{"label": p["label"], "match": p["match"]} for p in detect_pii(text, self.valves.pii_patterns_enabled)]
         try:
             spans = await self._pii_tracer_spans(text)
         except Exception as e:  # connection, timeout, bad status, bad JSON
             if self._pii_fallback(e):
-                return [{"label": p["label"], "match": p["match"]} for p in detect_pii(text)]
+                return [{"label": p["label"], "match": p["match"]} for p in detect_pii(text, self.valves.pii_patterns_enabled)]
             return []
         return [{"label": str(s["label"]), "match": text[int(s["start"]):int(s["end"])]} for s in spans]
 
@@ -1138,50 +1122,32 @@ class Filter:
         return text
 
     async def _validate_fact(self, fact: Dict[str, Any]) -> Dict[str, Any]:
-        """validate_fact_no_pii with the configured engine (same return shape)."""
-        if not self._pii_use_model():
-            return validate_fact_no_pii(fact)
-        reasons: List[str] = []
+        """PII check of one extracted fact with the configured engine: its subject against
+        the blocklist, its subject and value for PII. Returns {"clean": bool,
+        "blocked_reasons": [text]}; reasons name the kind of PII, never the matched text."""
         subject = str(fact.get("subject", "") or "")
         value = str(fact.get("value", "") or "")
+        reasons: List[str] = []
         if subject.lower().strip() in PII_SUBJECT_BLOCKLIST:
             reasons.append(f"Blocked subject: '{subject}'")
-        # The model engine's reasons name the label only, never the matched text.
         reasons.extend(f"{h['label']} detected in value" for h in await self._pii_detect(value))
         reasons.extend(f"{h['label']} detected in subject" for h in await self._pii_detect(subject))
-        if not reasons:
-            return {"clean": True, "blocked_reasons": [], "scrubbed_fact": fact}
-        return {
-            "clean": False,
-            "blocked_reasons": reasons,
-            "scrubbed_fact": {
-                **fact,
-                "value": await self._pii_scrub(value),
-                "subject": await self._pii_scrub(subject),
-            },
-        }
+        return {"clean": not reasons, "blocked_reasons": reasons}
 
     async def _filter_facts_pii(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """filter_facts_pii with the configured engine: drop or redact facts with PII (pii_filter_mode)."""
-        if not self._pii_use_model():
-            return filter_facts_pii(
-                facts,
-                mode=self.valves.pii_filter_mode,
-                logger_fn=lambda msg: self._log(f"PII filter: {msg}", "warning"),
-            )
+        """The facts that pass the PII check. A fact that fails is dropped whole; the other
+        facts from the same message are kept."""
         cleaned: List[Dict[str, Any]] = []
         for fact in facts:
             result = await self._validate_fact(fact)
             if result["clean"]:
                 cleaned.append(fact)
                 continue
+            # Type and reasons only: the subject may itself hold the PII.
             self._log(
-                f"PII filter: PII blocked in fact ({fact.get('type')}/{fact.get('subject')}): "
-                f"{', '.join(result['blocked_reasons'])}",
+                f"PII filter: PII blocked in a {fact.get('type')} fact: {', '.join(result['blocked_reasons'])}",
                 "warning",
             )
-            if self.valves.pii_filter_mode == "redact":
-                cleaned.append(result["scrubbed_fact"])
         return cleaned
 
     async def _update_user_memory_state(
@@ -1234,7 +1200,11 @@ class Filter:
 
             # Local date of the server (honours the container's TZ), so "this year"
             # and "last month" resolve the way the user means them.
-            merge_prompt = f"""TODAY: {datetime.now().astimezone().strftime("%Y-%m-%d")}
+            # The model is told the types of the fact_types valve on every call, so the valve is
+            # the one place they are set; the model's own prompt only explains what they mean.
+            merge_prompt = f"""ALLOWED TYPES: {", ".join(self._fact_types()) or "any"}
+
+TODAY: {datetime.now().astimezone().strftime("%Y-%m-%d")}
 
 EXISTING FACTS:
 {json.dumps([_for_prompt(f) for f in existing_facts], indent=2)}
@@ -1245,13 +1215,19 @@ EARLIER MESSAGES (context only, already processed):
 NEW MESSAGE:
 {json.dumps(new_scrubbed, indent=2)}"""
 
-            merged_json = await self._call_extraction_model(
-                merge_prompt, user=user, request=request
-            )
-            self._log(
-                f"Merge model returned: {merged_json[:500] if merged_json else 'NONE/EMPTY'}",
-                "info",
-            )
+            try:
+                merged_json = await asyncio.wait_for(
+                    self._call_extraction_model(merge_prompt, user=user, request=request),
+                    timeout=EXTRACTION_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                self._log(
+                    f"Extraction model gave no answer in {EXTRACTION_TIMEOUT_SECONDS} s - memory update skipped",
+                    "warning",
+                )
+                return
+            # The reply holds the user's facts and has not been PII-checked yet: length only.
+            self._log(f"Merge model returned {len(merged_json) if merged_json else 0} chars", "info")
 
             merged_data = None
             if merged_json:
@@ -1278,15 +1254,20 @@ NEW MESSAGE:
                 self._log("Merge result 'facts' is not a list - skipping store", "warning")
                 return
             self._log(f"Merge model returned {len(changes)} change(s)", "info")
+            changes = self._usable_changes(changes)
 
             if self._pii_enabled() and changes:
-                pre_count = len(changes)
-                changes = await self._filter_facts_pii(changes)
-                if pre_count - len(changes) > 0:
+                # A removal stores nothing, so it is not PII-checked: a fact with a blocked
+                # subject ("forget my passport") must still be removable.
+                removals = [c for c in changes if _fact_marked_removed(c)]
+                to_store = [c for c in changes if not _fact_marked_removed(c)]
+                checked = await self._filter_facts_pii(to_store)
+                if len(to_store) - len(checked) > 0:
                     self._log(
-                        f"PII post-validation: blocked {pre_count - len(changes)} fact(s) containing PII",
+                        f"PII post-validation: blocked {len(to_store) - len(checked)} fact(s) containing PII",
                         "warning",
                     )
+                changes = removals + checked
 
             if not changes:
                 self._log("No changes - skipping store", "info")
@@ -1306,7 +1287,8 @@ NEW MESSAGE:
             )
 
         except asyncio.TimeoutError:
-            self._log("Memory update timed out after 60 seconds", "warning")
+            # The 60 s limit on applying the changes, or a timeout raised by the embedding or reranker call.
+            self._log("Memory update timed out - nothing more was written for this turn", "warning")
         except Exception as e:
             self._log(
                 f"Failed to update memory state: {type(e).__name__}: {e}", "error"
@@ -1315,11 +1297,130 @@ NEW MESSAGE:
 
             self._log(f"State update traceback: {traceback.format_exc()}", "error")
 
+    def _fact_types(self) -> Dict[str, str]:
+        """type -> heading, in the order of the fact_types valve (entries `type` or
+        `type: Heading`). Empty when the valve is empty, which means any type."""
+        types: Dict[str, str] = {}
+        for entry in self.valves.fact_types:
+            name, _, heading = str(entry).partition(":")
+            name = name.strip().lower()
+            if name:
+                types[name] = heading.strip() or _type_title(name)
+        return types
+
+    def _usable_changes(self, changes: List[Any]) -> List[Dict[str, Any]]:
+        """The change items the rest of the update can use. Each item is checked on its own,
+        in code, so one bad item from the model cannot abort the whole turn's update:
+        - it must be a dict with a text type and subject;
+        - a removal passes as it is (matched on type + subject; its value is not used);
+        - anything to be stored also needs a type on the fact_types valve (when that list
+          is not empty), a confidence of at least the confidence_floor valve, and a text or
+          finite numeric value (a number is stored as text).
+        The rest are skipped. This is the only place the shape of an item is checked;
+        _apply_changes relies on it."""
+        allowed = self._fact_types()
+        floor = self.valves.confidence_floor
+        usable: List[Dict[str, Any]] = []
+        skipped = {"malformed": 0, "type not allowed": 0, "below the confidence floor": 0}
+        for item in changes:
+            if not isinstance(item, dict):
+                skipped["malformed"] += 1
+                continue
+            type_, subject, value = item.get("type"), item.get("subject"), item.get("value")
+            if not (isinstance(type_, str) and type_.strip() and isinstance(subject, str) and subject.strip()):
+                skipped["malformed"] += 1
+            elif _fact_marked_removed(item):
+                usable.append({**item, "value": value if isinstance(value, str) else ""})
+            elif allowed and _fact_key(item)[0] not in allowed:
+                skipped["type not allowed"] += 1
+            elif floor > 0 and _fact_confidence(item) < floor:
+                skipped["below the confidence floor"] += 1
+            elif isinstance(value, str) and value.strip():
+                usable.append(item)
+            elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+                usable.append({**item, "value": str(value)})
+            else:
+                skipped["malformed"] += 1
+        if len(usable) != len(changes):
+            self._log(
+                "Skipped change item(s) from the model: "
+                + ", ".join(f"{n} {why}" for why, n in skipped.items() if n),
+                "warning",
+            )
+        return usable
+
     def _query_text(self, messages: List[Dict[str, Any]]) -> str:
-        """The search text: the last query_window_messages user/assistant messages."""
+        """The search text: the last query_window_messages user/assistant messages that have text.
+        Assistant messages that only carry a tool call (the hidden recall entry, Open WebUI's own
+        hidden skill and knowledge entries, real tool calls) have no text and do not use up the window."""
         n = max(1, int(self.valves.query_window_messages))
-        window = [m for m in messages if m.get("role") in ("user", "assistant")][-n:]
-        return "\n".join(t for t in (content_to_text(m.get("content")) for m in window) if t)
+        texts = [
+            content_to_text(m.get("content"))
+            for m in messages
+            if m.get("role") in ("user", "assistant")
+        ]
+        return "\n".join([t for t in texts if t][-n:])
+
+    @staticmethod
+    def _recall_items(text: str) -> List[Dict[str, Any]]:
+        """The recalled facts as a hidden tool call and its result, in the item format Open WebUI
+        stores in an assistant message's `output` (same shape as its own hidden_tool_result)."""
+        call_id = f"fc_{uuid.uuid4().hex[:24]}"
+        return [
+            {
+                "type": "function_call",
+                "id": call_id,
+                "call_id": call_id,
+                "name": RECALL_TOOL_NAME,
+                "hidden": True,
+                "arguments": "{}",
+                "status": "completed",
+            },
+            {
+                "type": "function_call_output",
+                "id": f"fco_{uuid.uuid4().hex[:24]}",
+                "call_id": call_id,
+                "output": [{"type": "input_text", "text": text}],
+                "status": "completed",
+            },
+        ]
+
+    @staticmethod
+    def _sent_fact_lines(messages: List[Dict[str, Any]]) -> set:
+        """Every line of the earlier recalls that are still in this chat's history. Open WebUI
+        compacts the history before the inlet runs, so a recall it summarized away is not here
+        and its facts are sent again."""
+        call_ids = {
+            call.get("id")
+            for m in messages
+            for call in m.get("tool_calls") or []
+            if (call.get("function") or {}).get("name") == RECALL_TOOL_NAME
+        }
+        lines: set = set()
+        for m in messages:
+            if m.get("role") == "tool" and m.get("tool_call_id") in call_ids:
+                lines.update(content_to_text(m.get("content")).splitlines())
+        return lines
+
+    def _keep_recall(self, body: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Outlet: put the hidden tool result the inlet sent for this reply at the front of the
+        reply's stored output. Open WebUI saves the changed output and replays it on every later
+        turn. Returns the reply's new output, or None when nothing was added."""
+        message_id = body.get("id")
+        recall = self._pending_recall.pop((body.get("chat_id"), message_id), None)
+        if not recall:
+            return None
+        for message in body.get("messages", []):
+            if message.get("id") == message_id and message.get("role") == "assistant":
+                output = message.get("output")
+                if isinstance(output, list) and output:
+                    message["output"] = recall + output
+                    self._log("Outlet: recalled memories saved with the reply", "info")
+                    return message["output"]
+                self._log("Outlet: reply has no stored output; recalled memories not saved for this turn", "warning")
+                return None
+        self._log("Outlet: reply message not found; recalled memories not saved for this turn", "warning")
+        return None
 
     @staticmethod
     def _local_date(iso: Any) -> str:
@@ -1329,55 +1430,52 @@ NEW MESSAGE:
         except (TypeError, ValueError):
             return ""
 
-    def _format_memory_context(self, facts: List[Dict[str, Any]]) -> str:
-        """Render the selected facts grouped by type under a header carrying today's
-        date. Every stored value of a fact is shown: subject, value, sentiment,
-        confidence, and the dates it was first and last stated, so the chat model can
-        tell a fact from last night apart from one from last year and a firm fact from
-        a tentative one. Every type is rendered; no caps."""
+    def fact_line(self, f: Dict[str, Any]) -> str:
+        """One fact as the model sees it. Every stored value is shown: subject, value,
+        sentiment, confidence, and the dates it was first and last stated, so the chat
+        model can tell a fact from last night apart from one from last year and a firm
+        fact from a tentative one."""
+        subject = str(f.get("subject", "")).replace("_", " ").title()
+        value = f.get("value", "")
+        details = []
+        if f.get("sentiment"):
+            details.append(f"sentiment {f['sentiment']}")
+        if f.get("confidence") is not None:
+            details.append(f"confidence {f['confidence']:g}")
+        first = self._local_date(f.get("first_mentioned"))
+        if first:
+            details.append(f"first stated {first}")
+        last = self._local_date(f.get("last_updated"))
+        if last:
+            details.append(f"last stated {last}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        return f"  - {subject}: {value}{suffix}"
+
+    def _format_memory_context(self, facts: List[Dict[str, Any]], partial: bool = False) -> str:
+        """Render the facts grouped by type under a header carrying today's date. Every
+        type is rendered; no caps. `partial`: other facts were recalled earlier in this
+        chat and left out here; the header then says they still apply."""
         if not facts:
             return ""
         by_type: Dict[str, List[Dict[str, Any]]] = {}
         for f in facts:
             by_type.setdefault(str(f.get("type", "other")), []).append(f)
-        headers = {
-            "identity": "About You",
-            "status": "Current Status",
-            "ownership": "You Own",
-            "relationship": "Relationships",
-            "preference": "Preferences",
-            "skill": "Skills/Interests",
-            "goal": "Goals",
-            "event": "Events/Dates",
-        }
+        headers = self._fact_types()
         order = list(headers) + sorted(t for t in by_type if t not in headers)
         today = datetime.now().astimezone().strftime("%Y-%m-%d")
         parts = [
             f"=== USER MEMORY PROFILE (today is {today}; each fact shows its sentiment, the confidence it "
             "was recorded with (0 to 1), and the dates it was first and last stated; words like "
-            "'this morning' or 'yesterday' inside a fact refer to its last stated date, not to today) ==="
+            "'this morning' or 'yesterday' inside a fact refer to its last stated date, not to today"
+            + ("; these facts are new or changed: a changed fact replaces its earlier version, and the other facts recalled earlier in this chat still apply" if partial else "")
+            + ") ==="
         ]
         for t in order:
             if t not in by_type:
                 continue
             parts.append("")
-            parts.append(f"{headers.get(t, t.replace('_', ' ').title())}:")
-            for f in by_type[t]:
-                subject = str(f.get("subject", "")).replace("_", " ").title()
-                value = f.get("value", "")
-                details = []
-                if f.get("sentiment"):
-                    details.append(f"sentiment {f['sentiment']}")
-                if f.get("confidence") is not None:
-                    details.append(f"confidence {f['confidence']:g}")
-                first = self._local_date(f.get("first_mentioned"))
-                if first:
-                    details.append(f"first stated {first}")
-                last = self._local_date(f.get("last_updated"))
-                if last:
-                    details.append(f"last stated {last}")
-                suffix = f" ({', '.join(details)})" if details else ""
-                parts.append(f"  - {subject}: {value}{suffix}")
+            parts.append(f"{headers.get(t) or _type_title(t)}:")
+            parts.extend(self.fact_line(f) for f in by_type[t])
         parts.append("")
         parts.append("=== END MEMORY PROFILE ===")
         return "\n".join(parts)
@@ -1388,14 +1486,21 @@ NEW MESSAGE:
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
         __user__: Optional[Dict[str, Any]] = None,
         __request__: Optional[Request] = None,
+        __metadata__: Optional[Dict[str, Any]] = None,
+        __model__: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Inlet: embed the recent chat, pull the nearest facts, append them to the
-        latest user message. No model call; extraction runs after the reply.
+        Inlet: embed the recent chat, pull the nearest facts, give them to the model as a
+        hidden tool result right after the latest user message. No model call; the outlet
+        saves the same tool result with the reply; extraction runs after the reply.
         """
         self._log("=== INLET START ===", "info")
         if not __user__ or not __user__.get("id"):
             self._log("No user ID, skipping memory processing", "info")
+            return body
+        user_valves = self._user_valves(__user__)
+        if not user_valves.enabled:
+            self._log("Memory disabled by this user, skipping", "info")
             return body
 
         user_id = __user__["id"]
@@ -1404,7 +1509,7 @@ NEW MESSAGE:
         user_obj = await self._resolve_user(__user__)
 
         async def status(text: str, done: bool):
-            if self.valves.show_status and __event_emitter__:
+            if self.valves.show_status and user_valves.show_status and __event_emitter__:
                 await __event_emitter__(
                     {"type": "status", "data": {"description": text, "done": done}}
                 )
@@ -1412,41 +1517,86 @@ NEW MESSAGE:
         try:
             await status("🔍 Loading your memories...", False)
             messages = body.get("messages", [])
-            # Wait for a still-running extraction from the previous turn so the
-            # newest facts are included.
-            async with self._user_lock(user_id):
+            # Wait for a still-running extraction from the previous turn so the newest
+            # facts are included, but not for long: a read is safe without the lock.
+            lock = self._user_lock(user_id)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=INLET_WAIT_FOR_EXTRACTION_SECONDS)
+                locked = True
+            except asyncio.TimeoutError:
+                locked = False
+                self._log(
+                    f"Previous extraction still running after {INLET_WAIT_FOR_EXTRACTION_SECONDS} s; "
+                    "recalling without its facts",
+                    "warning",
+                )
+            try:
                 await self._init_store(__request__, user_obj)
                 injected_facts = await self._search_facts(
                     user_id, self._query_text(messages), __request__, user_obj,
                     threshold=self.valves.relevance_threshold, limit=self.valves.max_memories,
                 )
+            finally:
+                if locked:
+                    lock.release()
             self._log(f"Retrieved {len(injected_facts)} facts", "info")
 
-            memory_context = self._format_memory_context(injected_facts)
-            if memory_context and messages:
-                # Append the block to the latest user message. The persona system
-                # prompt, tool specs and history stay byte-identical turn to turn, so
-                # the server reuses its prompt cache; works with every chat template;
-                # survives Open WebUI's tool-call continuation requests, which are
-                # not filtered again. (A separate system message does not work: Open
-                # WebUI merges extra system messages into the first one, measured
-                # 2026-10-16.)
-                last_user = max(
-                    (i for i, m in enumerate(messages) if m.get("role") == "user"),
-                    default=None,
-                )
-                if last_user is not None:
-                    user_msg = messages[last_user]
-                    content = user_msg.get("content")
-                    block = f"\n\n[Relevant memories about the user]\n{memory_context}"
-                    if isinstance(content, str):
-                        user_msg["content"] = content + block
-                    elif isinstance(content, list):
-                        content.append({"type": "text", "text": block})
-                body["messages"] = messages
+            # Facts already recalled earlier in this chat are replayed from the saved chat, so
+            # only new and changed ones are sent.
+            sent_lines = self._sent_fact_lines(messages)
+            # A value with a line break renders as several lines; all of them must be there.
+            new_facts = [
+                f for f in injected_facts
+                if not all(line in sent_lines for line in self.fact_line(f).splitlines())
+            ]
+            already_sent = len(injected_facts) - len(new_facts)
+            memory_context = self._format_memory_context(new_facts, partial=already_sent > 0)
+            # Only on a new turn (the user's message is last). When a reply is being continued,
+            # its recalled facts are already in the history.
+            # A reply resumed after a tool approval also arrives with the user's message last
+            # (Open WebUI takes the paused reply out of `messages` before the inlet and puts it
+            # back after). The recall is sent again then, and it must be: the paused request
+            # never reached the outlet, so its recall was not saved with the reply.
+            new_turn = bool(messages) and messages[-1].get("role") == "user"
+            if new_turn:
+                self._log(f"{len(new_facts)} facts to send, {already_sent} already in this chat", "info")
+            if memory_context and new_turn:
+                # The facts go in as a hidden tool call and its result, right after the
+                # user's message, and the outlet saves the same pair with the reply
+                # (_keep_recall). Open WebUI then replays it from the saved chat on every
+                # later turn, so nothing in the past ever changes and the server reuses its
+                # prompt cache up to the new message. Until 7.5 the block was appended to
+                # the latest user message for that one request only, so on the next turn
+                # that message went out without it and the server re-read everything after
+                # it (measured 2026-11-08). The messages are built by Open WebUI's own
+                # converter with the reasoning format it uses for this model, the same
+                # call it makes for its own hidden entries, so the live turn and the
+                # replay are the same text.
+                # Imported here, not at the top: loading this filter must not depend on the
+                # middleware module's own import chain.
+                from open_webui.utils.middleware import get_reasoning_format
 
-            if injected_facts:
-                await status(f"💭 Recalled {len(injected_facts)} memories relevant to this chat", True)
+                recall = self._recall_items(f"[Relevant memories about the user]\n{memory_context}")
+                messages.extend(
+                    convert_output_to_messages(
+                        recall, raw=True, reasoning_format=get_reasoning_format(__model__ or {})
+                    )
+                )
+                body["messages"] = messages
+                key = ((__metadata__ or {}).get("chat_id"), (__metadata__ or {}).get("message_id"))
+                if all(key):
+                    self._pending_recall[key] = recall
+                    while len(self._pending_recall) > PENDING_RECALL_MAX:
+                        self._pending_recall.popitem(last=False)
+
+            if injected_facts and new_turn:
+                await status(
+                    f"💭 {len(injected_facts)} memories relevant to this chat "
+                    f"({len(new_facts)} new, {already_sent} recalled earlier)",
+                    True,
+                )
+            elif injected_facts:
+                await status(f"💭 {len(injected_facts)} memories relevant to this chat", True)
             else:
                 await status("👋 Getting to know you...", True)
 
@@ -1474,10 +1624,22 @@ NEW MESSAGE:
         __request__: Optional[Request] = None,
     ) -> Dict[str, Any]:
         """
-        Outlet: start fact extraction for the latest user message in the
-        background and return immediately, so the reply is never delayed.
+        Outlet: save the recalled facts with the reply (hidden tool result), then start
+        fact extraction for the latest user message in the background and return
+        immediately, so the reply is never delayed.
         """
         if not __user__ or not __user__.get("id"):
+            return body
+        kept_output = self._keep_recall(body)
+        if kept_output and __event_emitter__:
+            # The open chat page got the reply's output before this outlet ran, and Open WebUI
+            # only tells it about outlet changes to the visible text. Without this event the
+            # page's copy lacks the hidden entry, and the next thing that saves the chat from
+            # the page (rating, editing, switching branches) would write that copy over the
+            # saved one. A temporary chat lives only in the page, so this is also what keeps
+            # the entry there.
+            await __event_emitter__({"type": "chat:completion", "data": {"output": kept_output}})
+        if not self._user_valves(__user__).enabled:
             return body
         user_id = __user__["id"]
         conversation_id = body.get("chat_id", "default")
@@ -1508,3 +1670,4 @@ NEW MESSAGE:
         task.add_done_callback(self._bg_tasks.discard)
         self._log("Outlet: background memory update scheduled", "info")
         return body
+
